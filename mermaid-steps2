@@ -1,0 +1,73 @@
+graph TD
+    subgraph Primary Region Health Chain
+        A[ECS Tasks (App Logic)] -->|1. /health (200 OK)| B(Internal ALB Target Group Health Check)
+        B -->|2. If unhealthy| C(Internal NLB Target Group Health Check)
+        C -->|3. If unhealthy| D(API Gateway VPC Link Connection)
+        D -->|4. If API Gateway integration fails| E(Public NLB Target Group Health Check)
+        E -->|5. If unhealthy (API Gateway unreachable)| F(Route 53 Health Check: HTTP/S to Public NLB/API Gateway)
+        F -- If unhealthy --> G(Route 53 Failover Trigger)
+    end
+
+    subgraph Failover Action
+        G -- DNS Update --> H[Route 53 Secondary Record]
+        H -- New Traffic Flow --> I[Public NLB (Secondary Region)]
+    end
+
+    style A fill:#ccf,stroke:#333,stroke-width:2px
+    style B fill:#9cf,stroke:#333,stroke-width:2px
+    style C fill:#9cf,stroke:#333,stroke-width:2px
+    style D fill:#aef,stroke:#333,stroke-width:2px
+    style E fill:#fcc,stroke:#333,stroke-width:2px
+    style F fill:#f9f,stroke:#333,stroke-width:2px
+    style G fill:#f9f,stroke:#333,stroke-width:2px
+    style H fill:#9cf,stroke:#333,stroke-width:2px
+    style I fill:#fcc,stroke:#333,stroke-width:2px
+
+    How to Make the Primary Route 53 Unhealthy (and Trigger Failover)
+To trigger a failover, you need to disrupt the health check chain at some point. The diagram illustrates how a failure at any of the numbered steps (1 through 5) ultimately leads to step 6, where Route 53 detects the unhealthiness and initiates the failover.
+
+Here are the practical ways to make the Primary Route 53 health check unhealthy, starting from the application layer up:
+
+Simulate Application Failure (Most Realistic)
+
+Action: Disrupt the health of your ECS Tasks (App Logic).
+Method 1: Stop/Kill ECS Tasks: Manually stop or terminate all instances of your ECS service in the primary region. This will immediately cause the Internal ALB Target Group Health Check (B) to fail because its targets are gone or unresponsive.
+Method 2: Force Application Errors: Deploy a version of your ECS application that is programmed to return 5xx HTTP status codes (or simply not respond) from its /health endpoint. This directly causes the Internal ALB Target Group Health Check (B) to fail.
+Method 3: Scale Down ECS Service: Set the desired count of your ECS service to 0. This will gracefully stop all tasks, leaving the Internal ALB with no healthy targets.
+Effect: This causes a cascading failure up the chain:
+Internal ALB (B) reports unhealthy.
+Internal NLB (C) sees its target (Internal ALB) as unhealthy.
+API Gateway VPC Link (D) attempts to connect to an unhealthy NLB, resulting in integration failures.
+Public NLB (E) has its target (API Gateway's VPC Endpoint) become unreachable or return errors.
+Finally, the Route 53 Health Check (F) receives 5xx responses (or no response) from the API Gateway endpoint, triggering the failover.
+Disrupt Internal Load Balancers
+
+Action: Directly interfere with the Internal ALB (B) or Internal NLB (C) in the primary region.
+Method:
+Delete/Stop Internal ALB: Remove or stop the Internal ALB. The Internal NLB (C) will then see its target as unreachable.
+Delete/Stop Internal NLB: Remove or stop the Internal NLB. The API Gateway VPC Link (D) will then fail to connect.
+Effect: This causes the failure to propagate from the point of disruption upwards to the Route 53 Health Check (F), leading to failover.
+Disrupt API Gateway Connectivity
+
+Action: Break the connection between API Gateway (D) and its backend.
+Method:
+Delete API Gateway VPC Link: Removing the VPC Link in the primary region will immediately break API Gateway's connection to your internal infrastructure.
+Change API Gateway Integration Target: Modify the API Gateway integration for your /healthcheck endpoint to point to a non-existent or incorrect target.
+Effect: API Gateway will begin returning errors, which the Public NLB Health Check (E) and subsequently the Route 53 Health Check (F) will detect.
+Directly Manipulate Route 53 Health Check (Forced Failover)
+
+Action: Directly alter the status of the Route 53 Health Check (F) without affecting underlying resources. This is primarily for testing the failover mechanism itself.
+Method (AWS Console):
+Go to the Route 53 console.
+Navigate to "Health checks".
+Find the health check associated with your primary domain (the one checking your Public NLB/API Gateway endpoint).
+Select it and choose "Invert health check status" to "Yes". This will immediately mark it as unhealthy.
+Alternatively, you can temporarily change the monitored endpoint to something that doesn't exist, or pause/delete the health check (and remember to recreate it).
+Effect: This instantly triggers the Route 53 Failover Trigger (G), causing Route 53 to update DNS and direct traffic to the secondary region.
+Important Considerations for Testing:
+
+Never test in production without a strict maintenance window and clear communication. Use a dedicated testing environment that closely mirrors your production setup.
+Observe DNS TTLs: The speed of your failover depends on the TTL configured for your Route 53 records. Lower TTLs mean faster propagation but also more DNS queries.
+Monitor Everything: During testing, closely observe CloudWatch metrics and logs across all layers (ECS, Load Balancers, API Gateway, Route 53) to understand the failure propagation and confirm the failover.
+Plan for Rollback: Always have a clear strategy for restoring the primary region's health and failing back to it once your testing is complete.
+By following these steps, you can effectively test the resilience and failover capabilities of your multi-region architecture.
