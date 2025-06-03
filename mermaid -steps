@@ -1,0 +1,75 @@
+graph TD
+    subgraph Primary Region (Active)
+        R53P[Route 53 Primary Record] -- A records with Health Check --> PALB[Public ALB]
+        PALB -- HTTPS /api.yourdomain.com --> APIGW_P[API Gateway (Regional Endpoint)]
+        APIGW_P -- VPC Link --> NLB_P[NLB - Internal]
+        NLB_P -- TCP --> IALB_P[Internal ALB]
+        IALB_P -- HTTP/HTTPS --> ECS_P[ECS Tasks (App Logic)]
+        ECS_P -- /health (200 OK) --> IALB_P
+    end
+
+    subgraph Secondary Region (Standby)
+        R53S[Route 53 Secondary Record] -- Failover Target --> SALB[Public ALB]
+        SALB -- HTTPS /api.yourdomain.com --> APIGW_S[API Gateway (Regional Endpoint)]
+        APIGW_S -- VPC Link --> NLB_S[NLB - Internal]
+        NLB_S -- TCP --> IALB_S[Internal ALB]
+        IALB_S -- HTTP/HTTPS --> ECS_S[ECS Tasks (App Logic)]
+        ECS_S -- /health (200 OK) --> IALB_S
+    end
+
+    subgraph Health Check Propagation
+        ECS_P -- If non-200 --> IALB_P_HC[IALB Target Group Health Check (Path: /health)]
+        IALB_P_HC -- If unhealthy --> NLB_P_HC[NLB Target Group Health Check (TCP on IALB Listener)]
+        NLB_P_HC -- If unhealthy --> APIGW_P_VC[API Gateway VPC Link (fails to connect)]
+        APIGW_P_VC -- If API Gateway integration fails --> R53_HC_AGW[Route 53 Health Check (HTTP/S to API Gateway /healthcheck)]
+        R53_HC_AGW -- If unhealthy --> R53_Failover[Route 53 Failover Trigger]
+    end
+
+    R53_Failover -- DNS Update --> R53S
+    R53S -- New Traffic Flow --> SALB
+
+    style R53_Failover fill:#f9f,stroke:#333,stroke-width:2px
+    style R53_HC_AGW fill:#f9f,stroke:#333,stroke-width:2px
+    style R53P fill:#9cf,stroke:#333,stroke-width:2px
+    style R53S fill:#9cf,stroke:#333,stroke-width:2px
+    style APIGW_P_VC fill:#aef,stroke:#333,stroke-width:2px
+    style APIGW_P fill:#fcd,stroke:#333,stroke-width:2px
+    style APIGW_S fill:#fcd,stroke:#333,stroke-width:2px
+    style ECS_P fill:#ccf,stroke:#333,stroke-width:2px
+    style ECS_S fill:#ccf,stroke:#333,stroke-width:2px
+    style IALB_P fill:#ccf,stroke:#333,stroke-width:2px
+    style IALB_S fill:#ccf,stroke:#333,stroke-width:2px
+    style NLB_P fill:#ccf,stroke:#333,stroke-width:2px
+    style NLB_S fill:#ccf,stroke:#333,stroke-width:2px
+    style PALB fill:#fcc,stroke:#333,stroke-width:2px
+    style SALB fill:#fcc,stroke:#333,stroke-width:2px
+
+Explanation of the Mermaid Diagram
+This diagram visualizes the primary architecture flow, then specifically highlights the critical health check propagation that enables the failover.
+
+Primary Region (Active): This subgraph shows the active path where user traffic initially flows.
+
+Route 53 Primary Record (R53P): Your domain's DNS entry, configured with a health check.
+Public ALB (PALB): The internet-facing load balancer in the primary region.
+API Gateway (APIGW_P): The regional API Gateway endpoint.
+NLB - Internal (NLB_P): The Network Load Balancer inside your VPC.
+Internal ALB (IALB_P): The Application Load Balancer inside your VPC.
+ECS Tasks (App Logic) (ECS_P): Your containerized applications running on ECS.
+The arrows indicate the flow of requests.
+Secondary Region (Standby): This subgraph shows the duplicate infrastructure in the secondary region, ready to take over. It mirrors the primary region's setup.
+
+Route 53 Secondary Record (R53S): The failover target in Route 53.
+Public ALB (SALB), API Gateway (APIGW_S), NLB - Internal (NLB_S), Internal ALB (IALB_S), ECS Tasks (App Logic) (ECS_S): These are the identical components in the standby region.
+Health Check Propagation: This crucial subgraph illustrates how an issue at the ECS level cascades up the chain to trigger a Route 53 failover.
+
+ECS Tasks (/health): Your application in ECS exposes a /health endpoint. If this returns anything other than a 200 OK, it signifies a problem.
+IALB Target Group Health Check: The Internal ALB's health checks continuously query the /health endpoint on your ECS tasks. If these fail, the ALB marks the ECS tasks as unhealthy.
+NLB Target Group Health Check: The NLB checks the TCP listener of the Internal ALB. If the Internal ALB cannot serve traffic (because its targets are unhealthy), the NLB's health check will fail.
+API Gateway VPC Link: If the NLB becomes unhealthy, API Gateway's VPC Link will fail to connect or integrate with the backend, leading to API Gateway returning errors (e.g., 5xx).
+Route 53 Health Check (R53_HC_AGW): This is the ultimate health check configured in Route 53. It periodically sends a request to your API Gateway's health check endpoint (e.g., /healthcheck).
+Route 53 Failover Trigger (R53_Failover): If the Route 53 Health Check detects consecutive failures from the API Gateway, it triggers the DNS failover.
+Failover Action:
+
+When the R53_Failover is triggered, Route 53 updates the DNS for your domain.
+R53S (Secondary Record) becomes active, and new traffic is directed to the SALB (Secondary Public ALB).
+This diagram visually demonstrates the full chain of health dependency, from the application layer up to the global DNS service, enabling resilient multi-region failover.
