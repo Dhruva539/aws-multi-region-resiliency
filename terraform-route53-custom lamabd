@@ -1,0 +1,334 @@
+# connect-repo/main.tf
+
+# --- Variables ---
+# IMPORTANT: Replace the 'default' values with your actual environment details.
+
+variable "primary_aws_region_name" {
+  description = "The AWS region name for the primary deployment."
+  type        = string
+  default     = "us-east-1" # <--- REPLACE THIS
+}
+
+variable "secondary_aws_region_name" {
+  description = "The AWS region name for the secondary deployment."
+  type        = string
+  default     = "us-west-2" # <--- REPLACE THIS
+}
+
+variable "alb_health_check_path" {
+  description = "The HTTP/S path configured on your ALB's target group health check (e.g., /ping, /health)."
+  type        = string
+  default     = "/ping"
+}
+
+variable "alb_health_check_port" {
+  description = "The port for the Route 53 health check (matches your public ALB listener, e.g., 443 for HTTPS)."
+  type        = number
+  default     = 443
+}
+
+variable "alb_health_check_protocol" {
+  description = "The protocol for the Route 53 health check (HTTP or HTTPS)."
+  type        = string
+  default     = "HTTPS"
+}
+
+# Define the critical ECS services to monitor using the Lambda.
+# The Lambda will use these names/clusters to call ECS DescribeServices.
+variable "ecs_services_to_monitor_with_lambda" {
+  description = "A list of critical ECS services to monitor using the Lambda health checker."
+  type = list(object({
+    cluster_name = string
+    service_name = string
+    region       = string # "primary" or "secondary", for filtering which Lambda monitors which services
+  }))
+  default = [
+    {
+      cluster_name = "prod-api-cluster-us-east-1", # <--- REPLACE THIS
+      service_name = "users-api-service",          # <--- REPLACE THIS
+      region       = "primary"
+    },
+    {
+      cluster_name = "prod-api-cluster-us-east-1",
+      service_name = "products-api-service",
+      region       = "primary"
+    },
+    # Add any secondary region services that this same Lambda (or a secondary Lambda) should monitor.
+    # For a fully active-passive setup with distinct regions, you'd likely have a separate
+    # 'connect-repo' deployment for your secondary region that monitors its own services.
+    # This example focuses on primary region ECS monitoring with the Lambda deployed in primary.
+  ]
+}
+
+variable "lambda_ecs_monitor_function_name" {
+  description = "Name for the Lambda function that monitors ECS replica counts."
+  type        = string
+  default     = "ECSReplicaCountMonitor"
+}
+
+variable "lambda_ecs_monitor_schedule_expression" {
+  description = "CloudWatch Events schedule expression for the ECS replica count Lambda."
+  type        = string
+  default     = "rate(1 minute)" # Run every 1 minute for near real-time updates
+}
+
+variable "lambda_ecs_monitor_cloudwatch_namespace" {
+  description = "CloudWatch namespace for custom metrics published by the ECS monitoring Lambda."
+  type        = string
+  default     = "Custom/ECSReplicaMonitor"
+}
+
+
+# --- Data Source: Read Outputs from API Gateway Repo ---
+# This data source allows the connect-repo to get the DNS names and Zone IDs
+# of the ALBs from the apigateway-repo's Terraform state.
+data "terraform_remote_state" "apigateway_state" {
+  backend = "s3"
+  config = {
+    bucket = "my-company-terraform-states" # <--- REPLACE THIS WITH YOUR S3 STATE BUCKET
+    key    = "apigateway/terraform.tfstate"
+    region = "us-east-1" # Region where the APIGateway state bucket resides
+  }
+}
+
+# --- Lambda Function for ECS Replica Count Monitoring ---
+# This deploys the Python code from 'lambda_ecs_monitor_py' artifact.
+data "archive_file" "lambda_ecs_monitor_zip" {
+  type        = "zip"
+  source_file = "${path.module}/lambda_ecs_monitor.py" # Refers to the Python file
+  output_path = "${path.module}/lambda_ecs_monitor.zip"
+}
+
+resource "aws_iam_role" "lambda_ecs_monitor_role" {
+  provider = aws.primary
+  name     = "${var.lambda_ecs_monitor_function_name}-Role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Action = "sts:AssumeRole",
+      Effect = "Allow",
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+  tags = {
+    Name = "${var.lambda_ecs_monitor_function_name}-Role"
+  }
+}
+
+resource "aws_iam_role_policy" "lambda_ecs_monitor_policy" {
+  provider = aws.primary
+  name     = "${var.lambda_ecs_monitor_function_name}-Policy"
+  role     = aws_iam_role.lambda_ecs_monitor_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ],
+        Effect   = "Allow",
+        Resource = "arn:aws:logs:${var.primary_aws_region_name}:*:log-group:/aws/lambda/${var.lambda_ecs_monitor_function_name}:*"
+      },
+      {
+        Action = [
+          "ecs:DescribeServices",     # Required for Lambda to query ECS service status
+          "cloudwatch:PutMetricData"  # Required for Lambda to publish custom metrics
+        ],
+        Effect   = "Allow",
+        # Consider restricting 'Resource' to specific clusters/services if your security policy requires it.
+        # For simplicity, it's often "*" for these actions, but review your use case.
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_lambda_function" "ecs_replica_monitor" {
+  provider = aws.primary
+  function_name    = var.lambda_ecs_monitor_function_name
+  handler          = "lambda_ecs_monitor.lambda_handler" # Matches your Python file and handler function
+  runtime          = "python3.12" # Ensure this matches your Lambda code's runtime
+  role             = aws_iam_role.lambda_ecs_monitor_role.arn
+  timeout          = 60      # Max execution time in seconds (adjust based on number of services)
+  memory_size      = 256     # Memory allocated in MB (adjust based on workload)
+  filename         = data.archive_file.lambda_ecs_monitor_zip.output_path
+  source_code_hash = data.archive_file.lambda_ecs_monitor_zip.output_base64sha256
+
+  environment {
+    variables = {
+      # Pass the list of primary region ECS services to the Lambda as a JSON string
+      CLUSTERS_AND_SERVICES_TO_MONITOR = jsonencode([
+        for s in var.ecs_services_to_monitor_with_lambda : {
+          cluster_name = s.cluster_name
+          service_name = s.service_name
+        } if s.region == "primary" # Filter for services in the primary region
+      ])
+      CLOUDWATCH_NAMESPACE = var.lambda_ecs_monitor_cloudwatch_namespace
+      LOG_LEVEL            = "INFO"
+    }
+  }
+
+  tags = {
+    Name = var.lambda_ecs_monitor_function_name
+  }
+}
+
+# --- CloudWatch Event Rule to trigger Lambda ---
+# This schedules the Lambda function to run at a defined interval.
+resource "aws_cloudwatch_event_rule" "lambda_ecs_monitor_trigger_rule" {
+  provider = aws.primary
+  name                = "${var.lambda_ecs_monitor_function_name}-Trigger"
+  schedule_expression = var.lambda_ecs_monitor_schedule_expression
+  description         = "Triggers Lambda ECS replica count monitor periodically."
+}
+
+resource "aws_cloudwatch_event_target" "lambda_ecs_monitor_target" {
+  provider = aws.primary
+  rule      = aws_cloudwatch_event_rule.lambda_ecs_monitor_trigger_rule.name
+  arn       = aws_lambda_function.ecs_replica_monitor.arn
+}
+
+resource "aws_lambda_permission" "allow_cloudwatch_to_call_ecs_monitor_lambda" {
+  provider      = aws.primary
+  statement_id  = "AllowExecutionFromCloudWatchForECSMonitor"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.ecs_replica_monitor.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.lambda_ecs_monitor_trigger_rule.arn
+}
+
+
+# --- CloudWatch Metric Alarms for Custom Lambda ECS Metrics ---
+# These alarms monitor the 'RunningTaskCount' metric published by the Lambda function.
+# An alarm will trigger if a service's running tasks drop to 0.
+resource "aws_cloudwatch_metric_alarm" "ecs_custom_running_tasks_alarm" {
+  provider = aws.primary
+
+  # Iterate over the primary ECS services defined in the variable
+  # A unique alarm is created for each service.
+  for_each = { for s in var.ecs_services_to_monitor_with_lambda : "${s.cluster_name}-${s.service_name}" => s if s.region == "primary" }
+
+  alarm_name          = "${each.value.service_name}-CustomRunningTasksZeroAlarm"
+  comparison_operator = "LessThanThreshold" # Alarm if metric is less than threshold
+  evaluation_periods  = 1                   # Evaluate over 1 period
+  metric_name         = "RunningTaskCount"  # The metric name published by Lambda
+  namespace           = var.lambda_ecs_monitor_cloudwatch_namespace # Custom namespace used by Lambda
+  period              = 60                  # Check every 60 seconds (1 minute)
+  statistic           = "Minimum"           # If value drops below 1, alarm
+  threshold           = 1                   # If RunningTaskCount drops below 1 (i.e., 0)
+
+  # Dimensions for the custom metric to target specific cluster/service
+  dimensions = {
+    ClusterName = each.value.cluster_name
+    ServiceName = each.value.service_name
+  }
+
+  alarm_description = "Alarms if custom monitored ECS service ${each.value.service_name} has 0 running tasks."
+
+  tags = {
+    Service     = each.value.service_name
+    AlarmType   = "Custom-RunningTasksZero"
+    Environment = "Production"
+    Region      = "Primary"
+  }
+}
+
+# --- PRIMARY REGION Route 53 Health Checks ---
+
+# Route 53 Health Check for the Primary Region's Public ALB (Layer 2)
+# This monitors the public-facing ALB endpoint directly.
+resource "aws_route53_health_check" "primary_alb_health_check" {
+  provider = aws.primary
+  type          = var.alb_health_check_protocol
+  fqdn          = data.terraform_remote_state.apigateway_state.outputs.primary_alb_dns_name
+  port          = var.alb_health_check_port
+  resource_path = var.alb_health_check_path
+  measure_latency     = true
+  request_interval    = 10
+  failure_threshold   = 3
+  enable_sni          = (var.alb_health_check_protocol == "HTTPS" ? true : false)
+
+  tags = {
+    Name        = "Primary-ALB-HC"
+    Environment = "Production"
+    Region      = "Primary"
+  }
+}
+
+# Route 53 Health Checks linked to Custom Lambda CloudWatch Alarms for ECS Services
+# These Route 53 health checks directly reflect the state of the CloudWatch alarms.
+# If an alarm goes into ALARM state (replica count is 0), this R53 HC becomes unhealthy.
+resource "aws_route53_health_check" "ecs_custom_health_check_from_lambda_alarm" {
+  provider = aws.primary
+
+  # Iterate over the custom CloudWatch alarms created above
+  for_each = aws_cloudwatch_metric_alarm.ecs_custom_running_tasks_alarm
+
+  alarm_identifier {
+    name   = each.value.alarm_name # The name of the CloudWatch alarm
+    region = var.primary_aws_region_name
+  }
+
+  type                = "CLOUDWATCH_METRIC"
+  invert_health_check = false # If alarm is ALARM, health check is unhealthy.
+
+  tags = {
+    Name        = "R53-HC-${each.key}" # e.g., "R53-HC-prod-api-cluster-us-east-1-users-api-service"
+    Environment = "Production"
+    MonitorType = "Lambda-ECS-Replica"
+  }
+}
+
+# Route 53 Calculated Health Check for Primary Region's Overall API Health
+# This is the central aggregation point. It combines the health of:
+# 1. The public ALB (which represents API Gateway reachability).
+# 2. All critical ECS services (replica count, as monitored by Lambda).
+# If ANY of these child health checks become unhealthy, this overall HC becomes unhealthy.
+resource "aws_route53_health_check" "primary_api_overall_health_check" {
+  provider = aws.primary
+  type = "CALCULATED"
+
+  # List all child health check IDs that contribute to the overall health.
+  # This uses the ALB health check and all dynamically created ECS replica count health checks.
+  child_health_check_ids = concat(
+    [aws_route53_health_check.primary_alb_health_check.id],
+    [for hc in aws_route53_health_check.ecs_custom_health_check_from_lambda_alarm : hc.id]
+  )
+
+  # Setting child_health_threshold to the total number of children means
+  # ALL child health checks must be healthy for this calculated health check to be healthy.
+  child_health_threshold = length(aws_route53_health_check.primary_api_overall_health_check.child_health_check_ids)
+
+  tags = {
+    Name        = "Overall-API-HC"
+    Environment = "Production"
+    Region      = "Primary"
+  }
+}
+
+# --- SECONDARY REGION HEALTH CHECKS ---
+# Route 53 Health Check for the Secondary Region's Public ALB
+# This is typically simpler for active-passive, as it only needs to check the secondary ALB.
+resource "aws_route53_health_check" "secondary_alb_health_check" {
+  provider = aws.secondary
+  type          = var.alb_health_check_protocol
+  fqdn          = data.terraform_remote_state.apigateway_state.outputs.secondary_alb_dns_name
+  port          = var.alb_health_check_port
+  resource_path = var.alb_health_check_path
+  measure_latency   = true
+  request_interval  = 10
+  failure_threshold = 3
+  enable_sni        = (var.alb_health_check_protocol == "HTTPS" ? true : false)
+
+  tags = {
+    Name        = "Secondary-ALB-HC"
+    Environment = "Production"
+    Region      = "Secondary"
+  }
+}
