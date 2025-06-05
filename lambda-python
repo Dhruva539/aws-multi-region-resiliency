@@ -1,0 +1,158 @@
+import os
+import json
+import logging
+import boto3
+
+# Configure logging for the Lambda function
+logger = logging.getLogger()
+logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+# Initialize AWS clients for ECS and CloudWatch
+ecs_client = boto3.client('ecs')
+cloudwatch_client = boto3.client('cloudwatch')
+
+def lambda_handler(event, context):
+    """
+    Lambda function to periodically monitor ECS service running task counts
+    and publish them as custom CloudWatch metrics.
+
+    These custom metrics can then be used by CloudWatch Alarms, which in turn
+    can drive Route 53 health checks for failover purposes.
+    """
+    
+    # Retrieve configuration from environment variables.
+    # CLUSTERS_AND_SERVICES_TO_MONITOR is expected to be a JSON string
+    # e.g., '[{"cluster_name": "my-cluster", "service_name": "my-service"}]'
+    clusters_and_services_json = os.environ.get('CLUSTERS_AND_SERVICES_TO_MONITOR', '[]')
+    
+    try:
+        # Parse the JSON string into a Python list of dictionaries
+        clusters_and_services = json.loads(clusters_and_services_json)
+    except json.JSONDecodeError:
+        # Log an error if the environment variable is not valid JSON
+        logger.error("Failed to parse CLUSTERS_AND_SERVICES_TO_MONITOR environment variable. Ensure it's valid JSON.")
+        return {
+            'statusCode': 400,
+            'body': 'Invalid configuration for CLUSTERS_AND_SERVICES_TO_MONITOR'
+        }
+
+    # Retrieve the CloudWatch namespace for custom metrics from environment variables
+    cloudwatch_namespace = os.environ.get('CLOUDWATCH_NAMESPACE', 'Custom/ECSReplicaMonitor')
+
+    logger.info(f"Starting ECS replica count monitoring for {len(clusters_and_services)} services.")
+
+    # Iterate through each configured ECS service
+    for service_config in clusters_and_services:
+        cluster_name = service_config.get('cluster_name')
+        service_name = service_config.get('service_name')
+
+        # Validate that required configuration parameters are present
+        if not cluster_name or not service_name:
+            logger.warning(f"Skipping malformed service configuration: {service_config}. Missing cluster_name or service_name.")
+            continue
+
+        try:
+            # Call ECS API to get details of the specified service
+            response = ecs_client.describe_services(
+                cluster=cluster_name,
+                services=[service_name]
+            )
+
+            services = response.get('services')
+            if not services:
+                # If the service is not found, log a warning and treat running count as 0
+                logger.warning(f"Service '{service_name}' not found in cluster '{cluster_name}'. Publishing RunningTaskCount as 0.")
+                running_count = 0 
+                desired_count = 0 # Default to 0 desired if service not found
+            else:
+                # Extract running and desired task counts from the service description
+                running_count = services[0].get('runningCount', 0)
+                desired_count = services[0].get('desiredCount', 0) 
+                logger.info(f"Cluster: {cluster_name}, Service: {service_name}, Running Tasks: {running_count}, Desired Tasks: {desired_count}")
+
+            # Publish the running and desired counts as custom CloudWatch metrics
+            # The 'RunningTaskCount' metric is critical for triggering alarms
+            cloudwatch_client.put_metric_data(
+                Namespace=cloudwatch_namespace,
+                MetricData=[
+                    {
+                        'MetricName': 'RunningTaskCount',
+                        'Dimensions': [
+                            {'Name': 'ClusterName', 'Value': cluster_name},
+                            {'Name': 'ServiceName', 'Value': service_name}
+                        ],
+                        'Value': running_count,
+                        'Unit': 'Count',
+                        'Timestamp': datetime.utcnow() # Use UTC timestamp for consistency
+                    },
+                    {
+                        'MetricName': 'DesiredTaskCount', 
+                        'Dimensions': [
+                            {'Name': 'ClusterName', 'Value': cluster_name},
+                            {'Name': 'ServiceName', 'Value': service_name}
+                        ],
+                        'Value': desired_count,
+                        'Unit': 'Count',
+                        'Timestamp': datetime.utcnow()
+                    }
+                ]
+            )
+            logger.info(f"Published metrics for service '{service_name}' in cluster '{cluster_name}': RunningTaskCount={running_count}, DesiredTaskCount={desired_count}.")
+
+        # Handle specific ECS exceptions
+        except ecs_client.exceptions.ClusterNotFoundException:
+            logger.error(f"ECS Cluster '{cluster_name}' not found. Cannot monitor service '{service_name}'. Publishing RunningTaskCount as 0.")
+            # Publish 0 to ensure the alarm can still trigger if the cluster itself is gone
+            cloudwatch_client.put_metric_data(
+                Namespace=cloudwatch_namespace,
+                MetricData=[{
+                    'MetricName': 'RunningTaskCount',
+                    'Dimensions': [
+                        {'Name': 'ClusterName', 'Value': cluster_name},
+                        {'Name': 'ServiceName', 'Value': service_name}
+                    ],
+                    'Value': 0,
+                    'Unit': 'Count',
+                    'Timestamp': datetime.utcnow()
+                }]
+            )
+        except ecs_client.exceptions.ServiceNotFoundException:
+            logger.error(f"ECS Service '{service_name}' not found in cluster '{cluster_name}'. Publishing RunningTaskCount as 0.")
+            # Publish 0 if the service within the cluster is not found
+            cloudwatch_client.put_metric_data(
+                Namespace=cloudwatch_namespace,
+                MetricData=[{
+                    'MetricName': 'RunningTaskCount',
+                    'Dimensions': [
+                        {'Name': 'ClusterName', 'Value': cluster_name},
+                        {'Name': 'ServiceName', 'Value': service_name}
+                    ],
+                    'Value': 0,
+                    'Unit': 'Count',
+                    'Timestamp': datetime.utcnow()
+                }]
+            )
+        # Catch any other unexpected errors during the process
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while monitoring service '{service_name}' in cluster '{cluster_name}': {e}", exc_info=True)
+            # Publish 0 on any error to ensure the alarm can still trigger
+            cloudwatch_client.put_metric_data(
+                Namespace=cloudwatch_namespace,
+                MetricData=[{
+                    'MetricName': 'RunningTaskCount',
+                    'Dimensions': [
+                        {'Name': 'ClusterName', 'Value': cluster_name},
+                        {'Name': 'ServiceName', 'Value': service_name}
+                    ],
+                    'Value': 0,
+                    'Unit': 'Count',
+                    'Timestamp': datetime.utcnow()
+                }]
+            )
+
+    logger.info("ECS replica count monitoring complete for this invocation.")
+    return {
+        'statusCode': 200,
+        'body': 'ECS replica count monitoring complete.'
+    }
+
