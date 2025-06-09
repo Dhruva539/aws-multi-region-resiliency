@@ -1,0 +1,80 @@
+graph TD
+    subgraph Primary Region (Active)
+        A --> R53_DNS(Route 53 DNS: Custom Domain)
+        R53_DNS --> R53_Primary_Record(Primary A Record)
+        R53_Primary_Record --> R53_Primary_HC(Route 53 Health Check: Primary)
+        R53_Primary_HC --> CW_R53_Trigger_Alarm(CloudWatch Alarm: Route53FailoverTriggerAlarm)
+
+        subgraph Health Monitoring
+            EBS_Scheduler(EventBridge Scheduler) -- "Every 1 min" --> HCL(Lambda: HealthCheckLambda)
+            HCL -->|Performs Layered Health Checks| Primary_App_Stack(Primary Application Stack)
+            Primary_App_Stack(Primary Application Stack) -- "Route 53 -> NLB -> API GW -> VPC Link -> ALB -> ECS Fargate" --> HCL
+            HCL -->|Publishes Metric (0/1)| CW_App_Health_Metric(CloudWatch Metric: ApplicationOverallHealth)
+        end
+
+        CW_App_Health_Metric --> CW_App_Health_Alarm(CloudWatch Alarm: ApplicationOverallHealthAlarm)
+        CW_App_Health_Alarm -- "ALARM State (Primary Unhealthy)" --> SNS_Failover_Topic(SNS Topic: Failover Notification)
+        CW_App_Health_Alarm -- "OK State (Primary Recovered)" --> SNS_Failback_Topic(SNS Topic: Failback Notification)
+    end
+
+    subgraph Failover Orchestration (Primary Region)
+        SNS_Failover_Topic --> FPL(Lambda: FailoverProcessLambda)
+        FPL -->|Read Flag| SSM_User_Failover_Flag(SSM Parameter: User Failover Flag)
+        FPL -- "If Flag ON & Primary Unhealthy" --> Scale_Secondary(Scale Up Secondary ECS Services)
+        Scale_Secondary -->|Publishes Metric (0)| CW_R53_Trigger_Metric(CloudWatch Metric: Route53FailoverTrigger)
+        CW_R53_Trigger_Metric --> CW_R53_Trigger_Alarm
+    end
+
+    subgraph Secondary Region (Warm Standby / Active)
+        R53_DNS --> R53_Secondary_Record(Secondary A Record)
+        R53_Secondary_Record --> R53_Secondary_HC(Route 53 Health Check: Secondary)
+        R53_Secondary_HC --> Secondary_NLB(Network Load Balancer)
+        Secondary_NLB --> Secondary_App_Stack(Secondary Application Stack)
+        Secondary_App_Stack(Secondary Application Stack) -- "ECS Fargate Services" --> Secondary_NLB
+    end
+
+    subgraph Failback Orchestration (Primary Region)
+        SNS_Failback_Topic --> FBPL(Lambda: FailbackProcessLambda)
+        FBPL -->|Read Flag| SSM_User_Failback_Flag(SSM Parameter: User Failback Flag)
+        FBPL -- "If Flag ON & Primary Healthy" --> Scale_Down_Secondary(Scale Down Secondary ECS Services)
+        Scale_Down_Secondary -->|Publishes Metric (1)| CW_R53_Trigger_Metric
+    end
+
+    CW_R53_Trigger_Alarm -- "ALARM State" --> R53_Primary_HC(Route 53 Health Check: Primary)
+    CW_R53_Trigger_Alarm -- "OK State" --> R53_Primary_HC(Route 53 Health Check: Primary)
+
+    R53_Primary_HC -- "UNHEALTHY" --> R53_DNS(Route 53 DNS: Custom Domain)
+    R53_Primary_HC -- "HEALTHY" --> R53_DNS(Route 53 DNS: Custom Domain)
+
+    R53_DNS -- "Traffic Shift" --> Secondary_NLB(Network Load Balancer)
+    R53_DNS -- "Traffic Shift Back" --> Primary_NLB(Network Load Balancer)
+
+    Primary_NLB(Network Load Balancer) --> Primary_App_Stack(Primary Application Stack)
+
+    style R53_DNS fill:#fff,stroke:#333,stroke-width:2px
+    style R53_Primary_Record fill:#f9f,stroke:#333,stroke-width:2px
+    style R53_Secondary_Record fill:#f9f,stroke:#333,stroke-width:2px
+    style R53_Primary_HC fill:#f9f,stroke:#333,stroke-width:2px
+    style R53_Secondary_HC fill:#f9f,stroke:#333,stroke-width:2px
+    style CW_R53_Trigger_Alarm fill:#f9f,stroke:#333,stroke-width:2px
+    style CW_R53_Trigger_Metric fill:#f9f,stroke:#333,stroke-width:2px
+
+    style EBS_Scheduler fill:#9cf,stroke:#333,stroke-width:2px
+    style HCL fill:#9cf,stroke:#333,stroke-width:2px
+    style Primary_App_Stack fill:#f9f,stroke:#333,stroke-width:2px
+    style CW_App_Health_Metric fill:#f9f,stroke:#333,stroke-width:2px
+    style CW_App_Health_Alarm fill:#f9f,stroke:#333,stroke-width:2px
+    style SNS_Failover_Topic fill:#f9f,stroke:#333,stroke-width:2px
+    style SNS_Failback_Topic fill:#f9f,stroke:#333,stroke-width:2px
+
+    style FPL fill:#9cf,stroke:#333,stroke-width:2px
+    style SSM_User_Failover_Flag fill:#f9f,stroke:#333,stroke-width:2px
+    style Scale_Secondary fill:#9cf,stroke:#333,stroke-width:2px
+
+    style FBPL fill:#9cf,stroke:#333,stroke-width:2px
+    style SSM_User_Failback_Flag fill:#f9f,stroke:#333,stroke-width:2px
+    style Scale_Down_Secondary fill:#9cf,stroke:#333,stroke-width:2px
+
+    style Primary_NLB fill:#f9f,stroke:#333,stroke-width:2px
+    style Secondary_NLB fill:#f9f,stroke:#333,stroke-width:2px
+    style Secondary_App_Stack fill:#f9f,stroke:#333,stroke-width:2px
