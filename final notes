@@ -1,0 +1,73 @@
+This revision incorporates an AWS Step Functions workflow to orchestrate the failover process, providing better control, visibility, and error handling for the critical failover steps.
+
+Refined Automated Failover Strategy with Step Functions Orchestration
+The core idea remains an active-passive warm standby model. The key change is that once a primary region health issue is detected by the HealthCheckLambda, a dedicated Step Functions State Machine takes over the orchestration of scaling up the secondary region and signaling the DNS change.
+
+Key Components & Flow (Revised)
+Continuous Health Monitoring: An EventBridge Scheduler triggers a HealthCheckLambda in the primary region every minute.
+Comprehensive Health Checks: The HealthCheckLambda performs detailed checks across your entire application stack in the primary region.
+Orchestrated Failover Trigger:
+If HealthCheckLambda detects an issue in the primary region, it starts an execution of a Step Functions State Machine (e.g., FailoverOrchestratorStateMachine).
+If HealthCheckLambda finds the primary region healthy, it directly updates a custom CloudWatch metric to 1 (Healthy).
+Step Functions Orchestration (FailoverOrchestratorStateMachine):
+Scales up: Invokes the FailoverProcessLambda in the secondary region to scale up resources.
+Waits: Optionally waits for a period to allow secondary resources to warm up.
+Updates Metric: Puts the custom CloudWatch metric to 0 (Unhealthy) to signal the primary region is down.
+(Optional) Notifies: Sends out notifications about the failover.
+DNS Traffic Shift: A CloudWatch Alarm (monitoring the custom metric) transitions to ALARM state, which is linked to a Route 53 Health Check, causing Route 53 to redirect traffic to the secondary region.
+Automated Failback: When the primary region recovers, the HealthCheckLambda detects it and sets the custom metric to 1 (Healthy). The CloudWatch Alarm resets to OK, and Route 53 switches traffic back to the primary. Scaling down the secondary region is a separate, post-failback step.
+Failover Process Breakdown (Revised)
+Failure Detection (HealthCheckLambda):
+HealthCheckLambda performs all checks. If any critical component in the primary region is unhealthy.
+Start Step Functions Execution (HealthCheckLambda -> FailoverOrchestratorStateMachine):
+HealthCheckLambda invokes StepFunctions:StartExecution on the FailoverOrchestratorStateMachine. This invocation can pass details about the detected failure.
+Secondary Region Scale-Up (Step Functions -> FailoverProcessLambda):
+The FailoverOrchestratorStateMachine's first task is to invoke the FailoverProcessLambda (located in the secondary region).
+This ensures the secondary region starts scaling up proactively.
+Optional Wait (Step Functions):
+The FailoverOrchestratorStateMachine can include a Wait state, allowing time for the secondary ECS tasks to provision and become healthy before the DNS switch. This is crucial for a smooth transition in a warm standby model.
+Update Primary Region Health Metric (Step Functions):
+After initiating the scale-up and waiting (if configured), the FailoverOrchestratorStateMachine puts a custom CloudWatch metric (e.g., PrimaryRegionHealthStatus) with a value of 0 (Unhealthy).
+CloudWatch Alarm Trigger:
+A CloudWatch Alarm in the primary region, configured to monitor this PrimaryRegionHealthStatus metric, will transition to an ALARM state when the metric drops below a threshold.
+Route 53 DNS Switch:
+A Route 53 Health Check (configured in Route 53 Global service) is associated with the CloudWatch Alarm. When the alarm enters the ALARM state, the Route 53 Health Check marks the primary endpoint as unhealthy.
+Route 53's Failover Routing Policy then automatically directs all incoming traffic to the secondary region's endpoint.
+Failback Process Breakdown (Unchanged - Secondary to Primary)
+Primary Region Recovery Detection:
+The EventBridge Scheduler continues to trigger HealthCheckLambda every minute.
+HealthCheckLambda now detects that all components in the primary region are healthy again.
+Update Primary Region Health Metric (HealthCheckLambda):
+HealthCheckLambda puts the custom CloudWatch metric (PrimaryRegionHealthStatus) with a value indicating 1 (Healthy).
+CloudWatch Alarm Reset:
+The CloudWatch Alarm transitions back to the OK state.
+Route 53 DNS Switch Back:
+The Route 53 Health Check (monitoring the CloudWatch Alarm) marks the primary endpoint as healthy again.
+Route 53's Failover Routing Policy automatically switches traffic back to the primary region.
+Scale Down Secondary Region (Optional):
+After the primary region is confirmed to be healthy and traffic has shifted back, you can implement an additional step (e.g., another Lambda function triggered by a CloudWatch Event for the alarm transitioning to OK, or a manual step) to scale down the ECS tasks in the secondary region to minimize costs, returning to a "warm standby" state.
+Terraform Code Example (Updated)
+This updated Terraform code includes the Step Functions State Machine and modifies the HealthCheckLambda to interact with it.
+
+Terraform
+
+
+http://googleusercontent.com/immersive_entry_chip/0
+
+
+#### `health_check_lambda.py` (Primary Region - Updated)
+
+```python
+
+http://googleusercontent.com/immersive_entry_chip/1
+
+
+#### `failover_process_lambda.py` (Secondary Region) - No Change Needed
+
+This Lambda remains the same as its sole responsibility is to scale up services based on the input it receives (which now comes from Step Functions instead of directly from `HealthCheckLambda`).
+
+```python
+# No changes to this file from previous version.
+# It continues to scale up ECS services in the secondary region.
+Visualization of Steps (With Step Functions Orchestration)
+This new diagram explicitly shows the Step Functions State Machine as the orchestrator of the failover process.
