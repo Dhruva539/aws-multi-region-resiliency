@@ -1,0 +1,106 @@
+Our solution utilizes two AWS Regions: a Primary Region (actively serving traffic) and a Secondary Region (maintained in a warm standby state). Amazon Route 53 acts as the global DNS service, directing user traffic based on the health status reported by CloudWatch Alarms. AWS Systems Manager Parameter Store holds critical configuration flags.
+
+Key AWS Services Involved:
+
+Amazon ECS (Elastic Container Service): Hosts your containerized application in both regions.
+Amazon API Gateway: Exposes your application's API endpoints in both regions.
+AWS CloudWatch: For application and infrastructure monitoring, custom metrics, and alarms that signal health changes.
+AWS Step Functions: Orchestrates complex failover and failback workflows.
+AWS Lambda: Executes specific logic for health checks, resource scaling (up/down), and state management.
+Amazon Route 53: Provides DNS resolution and intelligent traffic routing based on health checks.
+Amazon EventBridge Scheduler: Triggers periodic health checks in the primary region.
+AWS Systems Manager Parameter Store: Stores configuration flags (FailoverEnabled and FailoverActive).
+2. Solution Setup & Prerequisites
+Before the automated processes can function, the following must be in place:
+
+Application Deployment: Your application stack (API Gateway, NLB, ALB, ECS Fargate services) is deployed in both the Primary and Secondary AWS Regions. The secondary region's ECS services are initially scaled down (e.g., DesiredCount = 0 or 1) for warm standby.
+IAM Roles & Permissions: All Lambda functions and Step Functions state machines have appropriate IAM roles with permissions to interact with ECS, ELB, API Gateway, CloudWatch, and Parameter Store.
+Parameter Store Flags (Primary Region):
+/failover/{AppName}/FailoverEnabled: Set to true to enable automated failover. (Can be toggled to false to disable automation).
+/failover/{AppName}/FailoverActive: Initialized to false. This flag indicates if the system is currently in a failed-over state (true) or if the primary is active (false). It's managed dynamically by the orchestrators.
+Route 53 DNS Configuration:
+Your domain's DNS records are configured with an AWS Route 53 Failover Routing Policy.
+The Primary record points to the primary region's API Gateway.
+The Secondary record points to the secondary region's API Gateway.
+A Route 53 Health Check monitors a CloudWatch Alarm in the primary region, which is tied to the PrimaryRegionHealthStatus custom metric.
+3. Automated Failover Process
+This process is initiated when the primary region experiences a significant health degradation.
+
+Continuous Primary Health Monitoring:
+
+An EventBridge Scheduler rule periodically (e.g., every minute) invokes the HealthCheckLambda in the Primary Region.
+The HealthCheckLambda performs comprehensive checks on the primary application stack (API Gateway reachability, NLB/ALB target group health, ECS service health).
+It also reads the /failover/{AppName}/FailoverActive flag from Parameter Store.
+Detection & Orchestration Initiation:
+
+If the HealthCheckLambda detects that the Primary Region is UNHEALTHY AND the /failover/{AppName}/FailoverActive flag is currently false (meaning the system is not already failed over), it triggers an execution of the FailoverOrchestratorStateMachine.
+FailoverOrchestratorStateMachine Steps (Primary Region):
+
+Feature Flag Check: The state machine first reads the /failover/{AppName}/FailoverEnabled flag. If it's false, the execution gracefully stops (preventing unintended failovers).
+Set Failover Active Flag: The state machine immediately updates the /failover/{AppName}/FailoverActive flag in Parameter Store to true. This signals that a failover is in progress.
+Invoke Secondary Scale Up: It invokes the FailoverProcessLambda in the Secondary Region, passing an action_type: "FAILOVER" in the payload. This Lambda scales up ECS services in the secondary region to full capacity.
+Poll Secondary Readiness: The state machine enters a polling loop. It repeatedly invokes the SecondaryRegionHealthChecker Lambda in the Secondary Region until this Lambda reports that all critical secondary resources (ECS tasks, ELB targets) are fully scaled up and healthy. A Wait state is used between polls.
+Scale Down Primary Resources: Once the secondary region is confirmed ready, the state machine invokes the PrimaryRegionScaleDownLambda in the Primary Region. This Lambda sets the desired count of primary ECS services to 0 (or a minimum standby count) to de-provision resources.
+Update Primary Health Metric: Finally, the state machine publishes a value of 0 to the PrimaryRegionHealthStatus custom metric in CloudWatch.
+DNS Traffic Shift:
+
+The PrimaryRegionHealthAlarm (monitoring PrimaryRegionHealthStatus) detects the 0 value and transitions to an ALARM state.
+The Route 53 Health Check, which monitors this CloudWatch Alarm, registers the primary endpoint as Unhealthy.
+Route 53's Failover Routing Policy automatically redirects all incoming user DNS queries from the primary region's API Gateway to the secondary region's API Gateway.
+4. Automated Failback Process
+This process is initiated when the primary region recovers from its initial health degradation.
+
+Primary Region Recovery Detection:
+
+The HealthCheckLambda (Primary) continues its periodic checks on the primary application stack.
+If it detects that the Primary Region has become HEALTHY again AND the /failover/{AppName}/FailoverActive flag is true (meaning a failover is currently active), it triggers an execution of the FailbackOrchestratorStateMachine.
+FailbackOrchestratorStateMachine Steps (Primary Region):
+
+Set Failover Active Flag to False: The state machine immediately updates the /failover/{AppName}/FailoverActive flag in Parameter Store to false. This signals that the primary region is now resuming active status.
+Invoke Secondary Scale Down: It invokes the FailoverProcessLambda in the Secondary Region, passing an action_type: "FAILBACK" in the payload. This Lambda scales down ECS services in the secondary region back to their warm standby (0 or configured minimum) count.
+(Optional) Poll Secondary Scale-Down Status: The state machine can optionally poll the secondary region to confirm that resources have successfully scaled down.
+Update Primary Health Metric: Finally, the state machine publishes a value of 1 to the PrimaryRegionHealthStatus custom metric in CloudWatch.
+DNS Traffic Shift Back:
+
+The PrimaryRegionHealthAlarm detects the 1 value and returns to an OK state.
+The Route 53 Health Check registers the primary endpoint as Healthy.
+Route 53's Failover Routing Policy automatically redirects all incoming user DNS queries back from the secondary region's API Gateway to the primary region's API Gateway.
+Primary Region Self-Healing/Scale-Up:
+
+With traffic now directed back to the primary region, its ECS services (which were scaled down during failover) are expected to automatically scale up to their original desired counts via their own Auto Scaling Group configurations, provided the underlying issue that caused the initial failure has been resolved.
+5. Manual Failover Trigger (for DR Events)
+In scenarios requiring a controlled or forced failover (e.g., during a planned DR test or a confirmed, rapid incident), you can manually trigger the FailoverOrchestratorStateMachine.
+
+Prerequisite: Ensure the /failover/{AppName}/FailoverEnabled Parameter Store flag is set to true.
+
+Method 1: AWS Management Console
+
+Navigate to Step Functions: Open the AWS Management Console and go to the Step Functions service in your Primary AWS Region.
+Select State Machine: In the left navigation pane, choose "State machines" and select MyWebApp-FailoverOrchestrator.
+Start Execution: Click the "Start execution" button.
+Provide Input: You can leave the input as an empty JSON {} as the state machine will fetch the necessary flags from Parameter Store. Optionally, provide a descriptive "Execution name" (e.g., manual-dr-test-YYYYMMDD-HHMMSS).
+Confirm: Click "Start execution".
+Monitor: Observe the "Graph inspector" and "Event history" tabs to track the workflow's progress.
+Method 2: AWS CLI
+
+Configure CLI: Ensure your AWS CLI is installed, configured with appropriate permissions, and set to your Primary AWS Region.
+Get State Machine ARN:
+Bash
+
+aws states list-state-machines --region your-primary-region --query "stateMachines[?name=='MyWebApp-FailoverOrchestrator'].stateMachineArn" --output text
+Start Execution:
+Bash
+
+aws states start-execution \
+  --state-machine-arn "arn:aws:states:your-primary-region:ACCOUNT_ID:stateMachine:MyWebApp-FailoverOrchestrator" \
+  --name "manual-dr-failover-$(date +%Y%m%d%H%M%S)" \
+  --input "{}" \
+  --region your-primary-region
+(Replace your-primary-region and ACCOUNT_ID with your actual values.)
+6. Key Considerations & Best Practices
+Data Replication: This design focuses on application failover. Ensure your data layer (e.g., databases, S3 buckets) has a robust cross-region replication strategy (e.g., Aurora Global Database, DynamoDB Global Tables, S3 Cross-Region Replication).
+Comprehensive Monitoring: Implement additional application-specific metrics and alarms beyond basic infrastructure health to ensure a full picture of your system's operational status in both regions.
+Regular DR Testing (Game Days): Periodically test your entire failover and failback process to validate its functionality, identify bottlenecks, and ensure your teams are familiar with the procedures.
+DNS TTL: Manage your Route 53 DNS Time-To-Live (TTL) values. Lower TTLs (e.g., 60 seconds) enable faster failovers but can increase DNS query costs.
+Feature Flag Control: Use the /failover/{AppName}/FailoverEnabled flag responsibly. It acts as a kill switch for automation. Consider integrating its management into your CI/CD or operations pipeline for controlled updates.
+Idempotency: Ensure all Lambda functions and Step Functions steps are idempotent, meaning they can be safely retried multiple times without causing unintended side effects.
