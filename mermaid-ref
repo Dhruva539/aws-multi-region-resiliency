@@ -1,0 +1,66 @@
+graph TD
+    subgraph User[End User]
+        U[User Traffic]
+    end
+
+    subgraph Global_Services[AWS Global Services]
+        R53(Amazon Route 53)
+        SSM(AWS Systems Manager Parameter Store)
+    end
+
+    subgraph Primary_Region[Primary AWS Region (e.g., us-east-1)]
+        EBR[EventBridge Scheduler] --- "1. Triggers every minute" ---> HCL_P(AWS Lambda: HealthCheckLambda)
+        HCL_P --- "2. Performs Health Checks" --> API_GW_P[Amazon API Gateway (Custom Domain)]
+        API_GW_P -- "VPC Link" --> NLB_P(Network Load Balancer - Primary)
+        NLB_P --> ALB_P(Application Load Balancer - Primary)
+        ALB_P --> ECS_P[Amazon ECS Fargate (Tasks Running)]
+        ECS_P --> CLOUDWATCH_LOGS_P[CloudWatch Logs (App Logs)]
+
+        subgraph HealthCheckLambda_Flow[HealthCheckLambda Internal Logic]
+            HCL_P -- "Health Status" --> HCL_Decision{3. Primary Healthy?}
+            HCL_Decision -- No (Unhealthy) --> StartSFN(4. Start Step Functions: FailoverOrchestrator)
+            HCL_Decision -- Yes (Healthy) --> PutMetricHealthy(8. Put CW Metric: PrimaryRegionHealthStatus = 1)
+        end
+
+        subgraph FailoverOrchestrator_SF[AWS Step Functions: FailoverOrchestrator State Machine]
+            StartSFN --> GetFlag[5. Task: Get FailoverEnabled Flag from SSM]
+            GetFlag --> CheckFlag{6. Choice: FailoverEnabled == 'true'?}
+            CheckFlag -- No --> SF_FailoverDisabled[Succeed: Failover Disabled]
+            CheckFlag -- Yes --> InvokeFPL_S(7. Task: Invoke FailoverProcessLambda - Secondary)
+            InvokeFPL_S --> WaitWarmUp[8. Wait: Allow Secondary Warm-Up (e.g., 120s)]
+            WaitWarmUp --> PutMetricUnhealthy(9. Task: Put CW Metric: PrimaryRegionHealthStatus = 0)
+            PutMetricUnhealthy --> SF_OrchestrationComplete[Succeed: Failover Orchestration Complete]
+        end
+
+        PutMetricHealthy --> CW_Metric(CloudWatch Custom Metric: PrimaryRegionHealthStatus)
+        PutMetricUnhealthy --> CW_Metric
+
+        CW_Metric --> CW_Alarm(CloudWatch Alarm: PrimaryRegionHealthAlarm)
+    end
+
+    subgraph Secondary_Region[Secondary AWS Region (e.g., us-west-2)]
+        FPL_S_Lambda(AWS Lambda: FailoverProcessLambda - Secondary)
+        InvokeFPL_S -- "7. Invokes" --> FPL_S_Lambda
+        FPL_S_Lambda -- "Scales up Desired Count" --> ECS_S_WarmStandby[Amazon ECS Fargate (Warm Standby/Scaled Up)]
+        ECS_S_WarmStandby --> ALB_S(Application Load Balancer - Secondary)
+        ALB_S --> NLB_S(Network Load Balancer - Secondary)
+        NLB_S --> API_GW_S[Amazon API Gateway (Custom Domain)]
+        API_GW_S --> CLOUDWATCH_LOGS_S[CloudWatch Logs (App Logs)]
+    end
+
+    R53 -- "DNS Queries" --> U
+    R53 --> R53_HC[Route 53 Health Check (monitors CW Alarm)]
+
+    CW_Alarm -- "10. Alarm State Change" --> R53_HC
+    R53_HC -- "11. Health Check Status" --> R53
+
+    R53 -- "DNS Failover Policy" --> API_GW_P
+    R53 -- "DNS Failover Policy" --> API_GW_S
+
+    U --> API_GW_P -- "Active Traffic" --> Primary_Region_Stack[Primary App Stack]
+    U --> API_GW_S -- "Failover Traffic" --> Secondary_Region_Stack[Secondary App Stack]
+
+    Primary_Region_Stack -- "Primary Recovers" --> HCL_P
+    Secondary_Region_Stack -- "Scale Down Post-Failback (Optional)" --> ECS_S_WarmStandby
+
+    SSM -- "Feature Flag: /failover/MyWebApp/FailoverEnabled (true/false)" --> GetFlag
