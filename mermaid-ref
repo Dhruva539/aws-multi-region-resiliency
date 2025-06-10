@@ -9,26 +9,26 @@ graph TD
     end
 
     subgraph Primary_Region[Primary AWS Region (e.g., us-east-1)]
-        EBR[EventBridge Scheduler] --- "1. Triggers every minute" ---> HCL_P(AWS Lambda: HealthCheckLambda)
-        HCL_P --- "2. Performs Health Checks" --> API_GW_P[Amazon API Gateway (Custom Domain)]
+        EBR[EventBridge Scheduler] --- "Triggers every minute" ---> HCL_P(AWS Lambda: HealthCheckLambda)
+        HCL_P --- "Performs Health Checks" --> API_GW_P[Amazon API Gateway (Custom Domain)]
         API_GW_P -- "VPC Link" --> NLB_P(Network Load Balancer - Primary)
         NLB_P --> ALB_P(Application Load Balancer - Primary)
         ALB_P --> ECS_P[Amazon ECS Fargate (Tasks Running)]
         ECS_P --> CLOUDWATCH_LOGS_P[CloudWatch Logs (App Logs)]
 
         subgraph HealthCheckLambda_Flow[HealthCheckLambda Internal Logic]
-            HCL_P -- "Health Status" --> HCL_Decision{3. Primary Healthy?}
-            HCL_Decision -- No (Unhealthy) --> StartSFN(4. Start Step Functions: FailoverOrchestrator)
-            HCL_Decision -- Yes (Healthy) --> PutMetricHealthyStep(8. Put CW Metric: PrimaryRegionHealthStatus = 1)
+            HCL_P -- "Health Status" --> HCL_Decision{Primary Healthy?}
+            HCL_Decision -- No (Unhealthy) --> StartSFN(Start Step Functions: FailoverOrchestrator)
+            HCL_Decision -- Yes (Healthy) --> PutMetricHealthyStep(Put CW Metric: PrimaryRegionHealthStatus = 1)
         end
 
         subgraph FailoverOrchestrator_SF[AWS Step Functions: FailoverOrchestrator State Machine]
-            StartSFN --> GetFlag[5. Task: Get FailoverEnabled Flag from SSM]
-            GetFlag --> CheckFlag{6. Choice: FailoverEnabled == 'true'?}
+            StartSFN --> GetFlag[Task: Get FailoverEnabled Flag from SSM]
+            GetFlag --> CheckFlag{Choice: FailoverEnabled == 'true'?}
             CheckFlag -- No --> SF_FailoverDisabled[Succeed: Failover Disabled]
-            CheckFlag -- Yes --> InvokeFPL_S(7. Task: Invoke FailoverProcessLambda - Secondary)
-            InvokeFPL_S --> WaitWarmUp[8. Wait: Allow Secondary Warm-Up (e.g., 120s)]
-            WaitWarmUp --> PutMetricUnhealthyStep(9. Task: Put CW Metric: PrimaryRegionHealthStatus = 0)
+            CheckFlag -- Yes --> InvokeFPL_S(Task: Invoke FailoverProcessLambda - Secondary)
+            InvokeFPL_S --> WaitWarmUp[Wait: Allow Secondary Warm-Up (e.g., 120s)]
+            WaitWarmUp --> PutMetricUnhealthyStep(Task: Put CW Metric: PrimaryRegionHealthStatus = 0)
             PutMetricUnhealthyStep --> SF_OrchestrationComplete[Succeed: Failover Orchestration Complete]
         end
 
@@ -40,7 +40,7 @@ graph TD
 
     subgraph Secondary_Region[Secondary AWS Region (e.g., us-west-2)]
         FPL_S_Lambda(AWS Lambda: FailoverProcessLambda - Secondary)
-        InvokeFPL_S -- "7. Invokes" --> FPL_S_Lambda
+        InvokeFPL_S -- "Invokes" --> FPL_S_Lambda
         FPL_S_Lambda -- "Scales up Desired Count" --> ECS_S_WarmStandby[Amazon ECS Fargate (Warm Standby/Scaled Up)]
         ECS_S_WarmStandby --> ALB_S(Application Load Balancer - Secondary)
         ALB_S --> NLB_S(Network Load Balancer - Secondary)
@@ -51,8 +51,8 @@ graph TD
     R53 -- "DNS Queries" --> U
     R53 --> R53_HC[Route 53 Health Check (monitors CW Alarm)]
 
-    CW_Alarm -- "10. Alarm State Change" --> R53_HC
-    R53_HC -- "11. Health Check Status" --> R53
+    CW_Alarm -- "Alarm State Change" --> R53_HC
+    R53_HC -- "Health Check Status" --> R53
 
     R53 -- "DNS Failover Policy" --> API_GW_P
     R53 -- "DNS Failover Policy" --> API_GW_S
