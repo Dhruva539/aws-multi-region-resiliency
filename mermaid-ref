@@ -19,7 +19,7 @@ graph TD
         subgraph HealthCheckLambda_Flow[HealthCheckLambda Internal Logic]
             HCL_P -- "Health Status" --> HCL_Decision{3. Primary Healthy?}
             HCL_Decision -- No (Unhealthy) --> StartSFN(4. Start Step Functions: FailoverOrchestrator)
-            HCL_Decision -- Yes (Healthy) --> PutMetricHealthy(8. Put CW Metric: PrimaryRegionHealthStatus = 1)
+            HCL_Decision -- Yes (Healthy) --> PutMetricHealthyStep(8. Put CW Metric: PrimaryRegionHealthStatus = 1)
         end
 
         subgraph FailoverOrchestrator_SF[AWS Step Functions: FailoverOrchestrator State Machine]
@@ -28,12 +28,12 @@ graph TD
             CheckFlag -- No --> SF_FailoverDisabled[Succeed: Failover Disabled]
             CheckFlag -- Yes --> InvokeFPL_S(7. Task: Invoke FailoverProcessLambda - Secondary)
             InvokeFPL_S --> WaitWarmUp[8. Wait: Allow Secondary Warm-Up (e.g., 120s)]
-            WaitWarmUp --> PutMetricUnhealthy(9. Task: Put CW Metric: PrimaryRegionHealthStatus = 0)
-            PutMetricUnhealthy --> SF_OrchestrationComplete[Succeed: Failover Orchestration Complete]
+            WaitWarmUp --> PutMetricUnhealthyStep(9. Task: Put CW Metric: PrimaryRegionHealthStatus = 0)
+            PutMetricUnhealthyStep --> SF_OrchestrationComplete[Succeed: Failover Orchestration Complete]
         end
 
-        PutMetricHealthy --> CW_Metric(CloudWatch Custom Metric: PrimaryRegionHealthStatus)
-        PutMetricUnhealthy --> CW_Metric
+        PutMetricHealthyStep --> CW_Metric(CloudWatch Custom Metric: PrimaryRegionHealthStatus)
+        PutMetricUnhealthyStep --> CW_Metric
 
         CW_Metric --> CW_Alarm(CloudWatch Alarm: PrimaryRegionHealthAlarm)
     end
