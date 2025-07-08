@@ -182,4 +182,83 @@ def handler(event, context):
             # Publish 0 for BinaryHealthCheck if ALB not found (no dimensions)
             publish_cloudwatch_metric(
                 cloudwatch_namespace,
-                'BinaryHealth
+                'BinaryHealthCheck',
+                0, # 0 means unhealthy
+                'Count',
+                [] # <--- NO DIMENSIONS HERE
+            )
+            return {
+                'statusCode': 404,
+                'body': json.dumps(f"ALB '{load_balancer_name}' not found. Published 0 to BinaryHealthCheck metric in '{cloudwatch_namespace}'.")
+            }
+
+        # Step 2: Get Target Group ARNs
+        target_group_arns = get_target_group_arns_from_alb(alb_arn)
+
+        healthy_tg_count = 0
+        total_tg_count = len(target_group_arns)
+
+        if total_tg_count == 0:
+            logger.warning(f"No target groups found for ALB '{load_balancer_name}'. Considering 100% healthy (no TGs).")
+            healthy_percentage = 100.0
+        else:
+            # Step 3: Check health of each target group
+            for tg_arn in target_group_arns:
+                if is_target_group_healthy(tg_arn):
+                    healthy_tg_count += 1
+
+            healthy_percentage = (healthy_tg_count / total_tg_count) * 100
+
+        logger.info(f"Overall ALB health: {healthy_tg_count}/{total_tg_count} target groups healthy ({healthy_percentage:.2f}%).")
+
+        # Determine overall status and binary metric value
+        if healthy_percentage >= healthy_threshold_percentage:
+            overall_status = "HEALTHY"
+            status_code = 200
+            binary_health_metric_value = 1 # 1 means healthy
+        else:
+            overall_status = "UNHEALTHY"
+            status_code = 500
+            binary_health_metric_value = 0 # 0 means unhealthy
+            logger.error(f"ALB health ({healthy_percentage:.2f}%) is below threshold ({healthy_threshold_percentage}%).")
+
+        # Publish the BinaryHealthCheck metric (no dimensions)
+        publish_cloudwatch_metric(
+            cloudwatch_namespace,
+            'BinaryHealthCheck',
+            binary_health_metric_value,
+            'Count', # Unit remains 'Count'
+            [] # <--- NO DIMENSIONS HERE
+        )
+
+        return {
+            'statusCode': status_code,
+            'body': json.dumps({
+                'message': f"ALB health check completed. Overall status: {overall_status}.",
+                'alb_name': load_balancer_name,
+                'alb_arn': alb_arn,
+                'total_target_groups': total_tg_count,
+                'healthy_target_groups': healthy_tg_count,
+                'healthy_percentage': f"{healthy_percentage:.2f}%",
+                'threshold_percentage': f"{healthy_threshold_percentage}%",
+                'overall_status': overall_status,
+                'published_binary_health_value': binary_health_metric_value,
+                'published_cloudwatch_namespace': cloudwatch_namespace
+            })
+        }
+
+    except Exception as e:
+        logger.error(f"Lambda execution failed during overall health check: {e}", exc_info=True)
+        
+        # Publish 0 to BinaryHealthCheck metric on general failure (no dimensions)
+        publish_cloudwatch_metric(
+            cloudwatch_namespace,
+            'BinaryHealthCheck',
+            0, # 0 means unhealthy on error
+            'Count',
+            [] # <--- NO DIMENSIONS HERE
+        )
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Internal Server Error: {e}')
+        }
